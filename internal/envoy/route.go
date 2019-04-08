@@ -28,8 +28,9 @@ import (
 // weighted cluster.
 func RouteRoute(r *dag.Route, services []*dag.HTTPService) *route.Route_Route {
 	ra := route.RouteAction{
-		RetryPolicy:   retryPolicy(r),
+		RetryPolicy:   PrepareRetryPolicy(r.RetryPolicy),
 		Timeout:       timeout(r),
+		IdleTimeout:   idleTimeout(r),
 		PrefixRewrite: r.PrefixRewrite,
 	}
 
@@ -60,7 +61,23 @@ func RouteRoute(r *dag.Route, services []*dag.HTTPService) *route.Route_Route {
 }
 
 func timeout(r *dag.Route) *time.Duration {
-	switch r.Timeout {
+	if r.TimeoutPolicy != nil {
+		return getTimeout(r.TimeoutPolicy.Timeout)
+	}
+
+	return nil
+}
+
+func idleTimeout(r *dag.Route) *time.Duration {
+	if r.TimeoutPolicy != nil {
+		return getTimeout(r.TimeoutPolicy.IdleTimeout)
+	}
+
+	return nil
+}
+
+func getTimeout(timeout time.Duration) *time.Duration {
+	switch timeout {
 	case 0:
 		// no timeout specified
 		return nil
@@ -69,24 +86,33 @@ func timeout(r *dag.Route) *time.Duration {
 		// envoy "infinite timeout"
 		return duration(0)
 	default:
-		return duration(r.Timeout)
+		return duration(timeout)
 	}
 }
 
-func retryPolicy(r *dag.Route) *route.RetryPolicy {
-	if r.RetryOn == "" {
+func PrepareRetryPolicy(policy *dag.RetryPolicy) *route.RetryPolicy {
+	if policy == nil {
+		return nil
+	}
+
+	if policy.RetryOn == "" {
 		return nil
 	}
 	rp := &route.RetryPolicy{
-		RetryOn: r.RetryOn,
+		RetryOn: policy.RetryOn,
 	}
-	if r.NumRetries > 0 {
-		rp.NumRetries = u32(r.NumRetries)
+	if policy.NumRetries > 0 {
+		rp.NumRetries = u32(policy.NumRetries)
 	}
-	if r.PerTryTimeout > 0 {
-		timeout := r.PerTryTimeout
+	if policy.PerTryTimeout > 0 {
+		timeout := policy.PerTryTimeout
 		rp.PerTryTimeout = &timeout
 	}
+
+	if len(policy.RetriableStatusCodes) > 0 {
+		rp.RetriableStatusCodes = policy.RetriableStatusCodes
+	}
+
 	return rp
 }
 

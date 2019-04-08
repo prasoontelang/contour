@@ -48,6 +48,34 @@ func (d *DAG) Statuses() []Status {
 	return d.statuses
 }
 
+type RetryPolicy struct {
+	// RetryOn specifies the conditions under which retry takes place.
+	// If empty, retries will not be performed.
+	RetryOn string
+
+	// NumRetries specifies the allowed number of retries.
+	// Ignored if RetryOn is blank, or defaults to 1 if RetryOn is set.
+	NumRetries int
+
+	// PerTryTimeout specifies the timeout per retry attempt.
+	// Ignored if RetryOn is blank.
+	PerTryTimeout time.Duration
+
+	// Retriable status codes
+	RetriableStatusCodes []uint32
+}
+
+type TimeoutPolicy struct {
+	// A timeout applied to requests on this route.
+	// A timeout of zero implies "use envoy's default"
+	// A timeout of -1 represents "infinity"
+	// TODO(dfc) should this move to service?
+	Timeout time.Duration
+
+	// an idle timeout for the connection
+	IdleTimeout time.Duration
+}
+
 type Route struct {
 	Prefix       string
 	object       interface{} // one of Ingress or IngressRoute
@@ -61,26 +89,14 @@ type Route struct {
 	// TODO(dfc) this should go on the service
 	Websocket bool
 
-	// A timeout applied to requests on this route.
-	// A timeout of zero implies "use envoy's default"
-	// A timeout of -1 represents "infinity"
-	// TODO(dfc) should this move to service?
-	Timeout time.Duration
-
-	// RetryOn specifies the conditions under which retry takes place.
-	// If empty, retries will not be performed.
-	RetryOn string
-
-	// NumRetries specifies the allowed number of retries.
-	// Ignored if RetryOn is blank, or defaults to 1 if RetryOn is set.
-	NumRetries int
-
-	// PerTryTimeout specifies the timeout per retry attempt.
-	// Ignored if RetryOn is blank.
-	PerTryTimeout time.Duration
-
 	// Indicates that during forwarding, the matched prefix (or path) should be swapped with this value
 	PrefixRewrite string
+
+	// the retry policy for this route
+	RetryPolicy *RetryPolicy
+
+	// the timeout policy for this route
+	TimeoutPolicy *TimeoutPolicy
 }
 
 func (r *Route) addHTTPService(s *HTTPService) {

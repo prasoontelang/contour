@@ -159,8 +159,10 @@ func TestRouteRoute(t *testing.T) {
 		},
 		"single service without retry-on": {
 			route: &dag.Route{
-				NumRetries:    7,                // ignored
-				PerTryTimeout: 10 * time.Second, // ignored
+				RetryPolicy: &dag.RetryPolicy{
+					NumRetries:    7,                // ignored
+					PerTryTimeout: 10 * time.Second, // ignored
+				},
 			},
 			services: []*dag.HTTPService{{
 				TCPService: service(s1),
@@ -176,10 +178,12 @@ func TestRouteRoute(t *testing.T) {
 		},
 		"retry-on: 503": {
 			route: &dag.Route{
-				Prefix:        "/",
-				RetryOn:       "503",
-				NumRetries:    6,
-				PerTryTimeout: 100 * time.Millisecond,
+				Prefix: "/",
+				RetryPolicy: &dag.RetryPolicy{
+					RetryOn:       "503",
+					NumRetries:    6,
+					PerTryTimeout: 100 * time.Millisecond,
+				},
 			},
 			services: []*dag.HTTPService{{
 				TCPService: service(s1),
@@ -202,8 +206,10 @@ func TestRouteRoute(t *testing.T) {
 		},
 		"timeout 90s": {
 			route: &dag.Route{
-				Prefix:  "/",
-				Timeout: 90 * time.Second,
+				Prefix: "/",
+				TimeoutPolicy: &dag.TimeoutPolicy{
+					Timeout: 90 * time.Second,
+				},
 			},
 			services: []*dag.HTTPService{{
 				TCPService: service(s1),
@@ -222,8 +228,10 @@ func TestRouteRoute(t *testing.T) {
 		},
 		"timeout infinity": {
 			route: &dag.Route{
-				Prefix:  "/",
-				Timeout: -1,
+				Prefix: "/",
+				TimeoutPolicy: &dag.TimeoutPolicy{
+					Timeout: -1,
+				},
 			},
 			services: []*dag.HTTPService{{
 				TCPService: service(s1),
@@ -237,6 +245,50 @@ func TestRouteRoute(t *testing.T) {
 						appendHeader("x-request-start", "t=%START_TIME(%s.%3f)%"),
 					),
 					Timeout: duration(0),
+				},
+			},
+		},
+		"idle timeout 90s": {
+			route: &dag.Route{
+				Prefix: "/",
+				TimeoutPolicy: &dag.TimeoutPolicy{
+					IdleTimeout: 90 * time.Second,
+				},
+			},
+			services: []*dag.HTTPService{{
+				TCPService: service(s1),
+			}},
+			want: &route.Route_Route{
+				Route: &route.RouteAction{
+					ClusterSpecifier: &route.RouteAction_Cluster{
+						Cluster: "default/kuard/8080/da39a3ee5e",
+					},
+					RequestHeadersToAdd: headers(
+						appendHeader("x-request-start", "t=%START_TIME(%s.%3f)%"),
+					),
+					IdleTimeout: duration(90 * time.Second),
+				},
+			},
+		},
+		"idle timeout infinity": {
+			route: &dag.Route{
+				Prefix: "/",
+				TimeoutPolicy: &dag.TimeoutPolicy{
+					IdleTimeout: -1,
+				},
+			},
+			services: []*dag.HTTPService{{
+				TCPService: service(s1),
+			}},
+			want: &route.Route_Route{
+				Route: &route.RouteAction{
+					ClusterSpecifier: &route.RouteAction_Cluster{
+						Cluster: "default/kuard/8080/da39a3ee5e",
+					},
+					RequestHeadersToAdd: headers(
+						appendHeader("x-request-start", "t=%START_TIME(%s.%3f)%"),
+					),
+					IdleTimeout: duration(0),
 				},
 			},
 		},

@@ -14,7 +14,10 @@
 package v1beta1
 
 import (
+	"fmt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"strings"
+	"time"
 )
 
 // IngressRouteSpec defines the spec of the CRD
@@ -38,6 +41,9 @@ type VirtualHost struct {
 	// are described in fqdn, the tls.secretName secret must contain a
 	// matching certificate
 	TLS *TLS `json:"tls,omitempty"`
+	// retry policy for all the routes under this virtual host, unless the routes
+	// have their own route policy defined
+	RetryPolicy *RetryPolicy `json:"retryPolicy,omitempty"`
 }
 
 // TLS describes tls properties. The CNI names that will be matched on
@@ -69,6 +75,74 @@ type Route struct {
 	PermitInsecure bool `json:"permitInsecure,omitempty"`
 	// Indicates that during forwarding, the matched prefix (or path) should be swapped with this value
 	PrefixRewrite string `json:"prefixRewrite,omitempty"`
+	// The request timeout for this route
+	TimeoutPolicy *TimeoutPolicy `json:"timeoutPolicy,omitempty"`
+	// The retry attempts for this route
+	RetryPolicy *RetryPolicy `json:"retryPolicy,omitempty"`
+}
+
+// TimeoutPolicy defines the attributes associated with timeout
+type TimeoutPolicy struct {
+	// Timeout for establishing a connection in milliseconds
+	Request *JsonDuration `json:"request"`
+	// Timeout for receiving a response in seconds
+	Idle *JsonDuration `json:"idle"`
+}
+
+// RetryPolicy defines the attributes associated with retrying policy
+type RetryPolicy struct {
+	// MaxRetries is maximum allowed number of retries
+	NumRetries string `json:"count"`
+	// Perform retry on failed requests with the matched status codes or aggregated as 5xx
+	OnStatusCodes []string `json:"onStatusCodes"`
+	// PerTryTimeout specifies the timeout per retry attempt. Ignored if OnStatusCodes are empty
+	PerTryTimeout *JsonDuration `json:"perTryTimeout"`
+}
+
+// new struct to parse from JSON and load directly as time.Duration
+type JsonDuration struct {
+	*time.Duration
+}
+
+// to Unmarshal bytes of JSON into JsonDuration type
+func (d *JsonDuration) UnmarshalJSON(b []byte) (err error) {
+
+	timeStr := strings.Trim(string(b), `"`)
+	duration, err := time.ParseDuration(timeStr)
+
+	if err != nil && timeStr == "infinity" {
+		duration = -1
+		err = nil
+	}
+
+	if err == nil {
+		// only if correctly parsed, we update the Duration. Else, Duration is initialized as nil
+		d.Duration = &duration
+	}
+	return
+}
+
+// to Marshal JsonDuration into JSON bytes type (unused)
+func (d JsonDuration) MarshalJSON() (b []byte, err error) {
+	return []byte(fmt.Sprintf(`"%s"`, d.String())), nil
+}
+
+// a wrapper function to interpret all forms of input received from the YAML file for contour
+func (d *JsonDuration) Time() (timeout time.Duration, valid bool) {
+	if d == nil {
+		// this means the timeout field (like request, idle, etc.) was not specified in the YAML file
+		// not specifying the timeout field is a valid input
+		timeout, valid = 0, true
+	} else if d.Duration == nil {
+		// this means the timeout field was incorrectly specified, hence it couldn't be casted to time.Duration
+		// incorrectly parsed timeout is an invalid input
+		timeout, valid = -1, false
+	} else {
+		// timeout was correctly parsed, hence valid input
+		timeout, valid = *d.Duration, true
+	}
+
+	return
 }
 
 // TCPProxy contains the set of services to proxy TCP connections.

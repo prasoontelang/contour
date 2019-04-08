@@ -21,7 +21,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
 	"github.com/google/go-cmp/cmp"
 	ingressroutev1 "github.com/heptio/contour/apis/contour/v1beta1"
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
 	"k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -2444,7 +2444,9 @@ func TestDAGInsert(t *testing.T) {
 									httpServices: servicemap(
 										httpService(s1),
 									),
-									Timeout: -1, // invalid timeout equals infinity ¯\_(ツ)_/¯.
+									TimeoutPolicy: &TimeoutPolicy{
+										Timeout: -1, // invalid timeout equals infinity ¯\_(ツ)_/¯.
+									},
 								},
 							),
 						},
@@ -2470,7 +2472,9 @@ func TestDAGInsert(t *testing.T) {
 									httpServices: servicemap(
 										httpService(s1),
 									),
-									Timeout: 90 * time.Second,
+									TimeoutPolicy: &TimeoutPolicy{
+										Timeout: 90 * time.Second,
+									},
 								},
 							),
 						},
@@ -2496,7 +2500,9 @@ func TestDAGInsert(t *testing.T) {
 									httpServices: servicemap(
 										httpService(s1),
 									),
-									Timeout: -1,
+									TimeoutPolicy: &TimeoutPolicy{
+										Timeout: -1,
+									},
 								},
 							),
 						},
@@ -2545,9 +2551,11 @@ func TestDAGInsert(t *testing.T) {
 									httpServices: servicemap(
 										httpService(s1),
 									),
-									RetryOn:       "gateway-error",
-									NumRetries:    6,
-									PerTryTimeout: 10 * time.Second,
+									RetryPolicy: &RetryPolicy{
+										RetryOn:       "gateway-error",
+										NumRetries:    6,
+										PerTryTimeout: 10 * time.Second,
+									},
 								},
 							),
 						},
@@ -4003,6 +4011,39 @@ func route(prefix string, obj interface{}, httpServices ...map[servicemeta]*HTTP
 	return &route
 }
 
+func routeWithTimeout(prefix string, obj interface{}, requestTimeout time.Duration, idleTimeout time.Duration) *Route {
+	route := route(prefix, obj)
+	route.TimeoutPolicy = &TimeoutPolicy{
+		Timeout:     requestTimeout,
+		IdleTimeout: idleTimeout,
+	}
+
+	return route
+}
+
+func jsonDuration(timeStr string) *ingressroutev1.JsonDuration {
+	duration, err := time.ParseDuration(timeStr)
+	if err != nil {
+		return &ingressroutev1.JsonDuration{Duration: nil}
+	} else {
+		return &ingressroutev1.JsonDuration{Duration: &duration}
+	}
+}
+
+func routeWithRetry(prefix string, obj interface{}, numRetries int, retryOn string, perTryTimeout time.Duration, retryCodes []uint32) *Route {
+	route := route(prefix, obj)
+	if retryOn != "" {
+		route.RetryPolicy = &RetryPolicy{
+			RetryOn:              retryOn,
+			PerTryTimeout:        perTryTimeout,
+			NumRetries:           numRetries,
+			RetriableStatusCodes: retryCodes,
+		}
+	}
+
+	return route
+}
+
 func tcpService(s *v1.Service) *TCPService {
 	return &TCPService{
 		Name:        s.Name,
@@ -4062,4 +4103,266 @@ func listeners(ls ...*Listener) []Vertex {
 		v = append(v, l)
 	}
 	return v
+}
+
+func TestIngressRouteTimeout(t *testing.T) {
+	// valid timeout values
+	ir1 := &ingressroutev1.IngressRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "example-com",
+			Namespace: "roots",
+		},
+		Spec: ingressroutev1.IngressRouteSpec{
+			VirtualHost: &ingressroutev1.VirtualHost{
+				Fqdn: "example.com",
+			},
+			Routes: []ingressroutev1.Route{
+				// valid timeout policy
+				{
+					Match: "/valid-timeout",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+					TimeoutPolicy: &ingressroutev1.TimeoutPolicy{
+						Request: jsonDuration("100ms"),
+						Idle:    jsonDuration("2s"),
+					}},
+				// empty timeout policy
+				{
+					Match: "/empty-timeout",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+				},
+				// invalid timeout
+				{
+					Match: "/invalid-timeout",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+					TimeoutPolicy: &ingressroutev1.TimeoutPolicy{
+						Request: jsonDuration("Connect there"),
+						Idle:    jsonDuration("5"),
+					}},
+				// infinite timeout
+				{
+					Match: "/infinite-timeout",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+					TimeoutPolicy: &ingressroutev1.TimeoutPolicy{
+						Request: jsonDuration("infinity"),
+						Idle:    jsonDuration("infinity"),
+					}},
+			},
+		},
+	}
+
+	tests := map[string]struct {
+		objs []*ingressroutev1.IngressRoute
+		want []Vertex
+	}{
+		"testing timeout policy": {
+			objs: []*ingressroutev1.IngressRoute{ir1},
+			want: listeners(
+				&Listener{
+					Port: 80,
+					VirtualHosts: virtualhosts(&VirtualHost{
+						Name: "example.com",
+						routes: routemap(
+							routeWithTimeout("/valid-timeout", ir1, 100*time.Millisecond, 2*time.Second),
+							routeWithRetry("/empty-timeout", ir1, 0, "", noTimeout, nil),
+							routeWithTimeout("/invalid-timeout", ir1, infiniteTimeout, infiniteTimeout),
+							routeWithTimeout("/infinite-timeout", ir1, infiniteTimeout, infiniteTimeout),
+						),
+					}),
+				}),
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			b := Builder{
+				KubernetesCache: KubernetesCache{
+					IngressRouteRootNamespaces: []string{"roots"},
+				},
+			}
+			for _, o := range tc.objs {
+				b.Insert(o)
+			}
+			dag := b.Build()
+			got := make(map[int]*Listener)
+			dag.Visit(func(v Vertex) {
+				switch v := v.(type) {
+				case *Listener:
+					got[v.Port] = v
+				}
+			})
+
+			want := make(map[int]*Listener)
+			for _, v := range tc.want {
+				switch v := v.(type) {
+				case *Listener:
+					want[v.Port] = v
+				}
+			}
+
+			opts := []cmp.Option{
+				cmp.AllowUnexported(Listener{}, VirtualHost{}, Route{}),
+			}
+			if diff := cmp.Diff(want, got, opts...); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
+func TestIngressRouteRetryPolicy(t *testing.T) {
+
+	ir1 := &ingressroutev1.IngressRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "example-com",
+			Namespace: "roots",
+		},
+		Spec: ingressroutev1.IngressRouteSpec{
+			VirtualHost: &ingressroutev1.VirtualHost{
+				Fqdn: "example.com",
+			},
+			Routes: []ingressroutev1.Route{
+				// valid retry policy
+				{
+					Match: "/valid-retry",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+					RetryPolicy: &ingressroutev1.RetryPolicy{
+						NumRetries:    "3",
+						OnStatusCodes: []string{"501", "502", "503"},
+						PerTryTimeout: jsonDuration("75ms"),
+					}},
+				// empty retry policy
+				{
+					Match: "/empty-retry",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}}},
+				// invalid retry policy
+				{
+					Match: "/invalid-retry-entries",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+					RetryPolicy: &ingressroutev1.RetryPolicy{
+						NumRetries:    "max-retries",
+						OnStatusCodes: []string{"501", "status", "503"},
+						PerTryTimeout: jsonDuration("3"),
+					}},
+				// status code < 400
+				{
+					Match: "/status-code-less-than-400",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+					RetryPolicy: &ingressroutev1.RetryPolicy{
+						NumRetries:    "8",
+						OnStatusCodes: []string{"408", "409", "501", "204", "505"},
+						PerTryTimeout: jsonDuration("40ms"),
+					}},
+				// infinite per try timeout
+				{
+					Match: "/infinite-per-try-timeout",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+					RetryPolicy: &ingressroutev1.RetryPolicy{
+						NumRetries:    "6",
+						OnStatusCodes: []string{"501"},
+						PerTryTimeout: jsonDuration("infinity"),
+					}},
+				// wildcard retry codes
+				{
+					Match: "/wildcard-50x-40x",
+					Services: []ingressroutev1.Service{{
+						Name: "kuard",
+						Port: 9999,
+					}},
+					RetryPolicy: &ingressroutev1.RetryPolicy{
+						NumRetries:    "3",
+						OnStatusCodes: []string{"50x", "40x"},
+						PerTryTimeout: jsonDuration("20ms"),
+					}},
+			},
+		},
+	}
+
+	tests := map[string]struct {
+		objs []*ingressroutev1.IngressRoute
+		want []Vertex
+	}{
+		"testing retry policy": {
+			objs: []*ingressroutev1.IngressRoute{ir1},
+			want: listeners(
+				&Listener{
+					Port: 80,
+					VirtualHosts: virtualhosts(&VirtualHost{
+						Name: "example.com",
+						routes: routemap(
+							routeWithRetry("/valid-retry", ir1, 3, "retriable-status-codes", 75*time.Millisecond, []uint32{501, 502, 503}),
+							routeWithRetry("/empty-retry", ir1, 0, "", 0, nil),
+							routeWithRetry("/invalid-retry-entries", ir1, 0, "retriable-status-codes", infiniteTimeout, []uint32{501, 503}),
+							routeWithRetry("/status-code-less-than-400", ir1, 8, "retriable-status-codes", 40*time.Millisecond, []uint32{501, 505}),
+							routeWithRetry("/infinite-per-try-timeout", ir1, 6, "retriable-status-codes", infiniteTimeout, []uint32{501}),
+							routeWithRetry("/wildcard-50x-40x", ir1, 3, "retriable-status-codes", 20*time.Millisecond, []uint32{500, 501, 502, 503, 504, 505, 506, 507, 508, 509}),
+						),
+					}),
+				}),
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			b := Builder{
+				KubernetesCache: KubernetesCache{
+					IngressRouteRootNamespaces: []string{"roots"},
+				},
+			}
+
+			for _, o := range tc.objs {
+				b.Insert(o)
+			}
+			dag := b.Build()
+			got := make(map[int]*Listener)
+			dag.Visit(func(v Vertex) {
+				switch v := v.(type) {
+				case *Listener:
+					got[v.Port] = v
+				}
+			})
+
+			want := make(map[int]*Listener)
+			for _, v := range tc.want {
+				switch v := v.(type) {
+				case *Listener:
+					want[v.Port] = v
+				}
+			}
+
+			opts := []cmp.Option{
+				cmp.AllowUnexported(Listener{}, VirtualHost{}, Route{}),
+			}
+
+			if diff := cmp.Diff(want, got, opts...); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
 }

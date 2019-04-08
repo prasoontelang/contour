@@ -17,16 +17,14 @@ package dag
 
 import (
 	"fmt"
+	"k8s.io/api/core/v1"
+	"k8s.io/api/extensions/v1beta1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/cache"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
-
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/api/extensions/v1beta1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/tools/cache"
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
 	ingressroutev1 "github.com/heptio/contour/apis/contour/v1beta1"
@@ -399,21 +397,43 @@ func prefixRoute(ingress *v1beta1.Ingress, prefix string) *Route {
 	// compute websocket enabled routes
 	wr := websocketRoutes(ingress)
 
-	var perTryTimeout time.Duration
-	if val, ok := ingress.Annotations[annotationPerTryTimeout]; ok {
-		perTryTimeout, _ = time.ParseDuration(val)
-	}
+	var updateRetry bool
 
-	return &Route{
+	r := &Route{
 		Prefix:        prefix,
 		object:        ingress,
 		HTTPSUpgrade:  tlsRequired(ingress),
 		Websocket:     wr[prefix],
-		Timeout:       parseAnnotationTimeout(ingress.Annotations, annotationRequestTimeout),
-		RetryOn:       ingress.Annotations[annotationRetryOn],
-		NumRetries:    parseAnnotation(ingress.Annotations, annotationNumRetries),
-		PerTryTimeout: perTryTimeout,
+		TimeoutPolicy: nil,
+		RetryPolicy:   nil,
 	}
+
+	if timeout, err := parseAnnotationTimeout(ingress.Annotations, annotationRequestTimeout); err == nil {
+		r.TimeoutPolicy = &TimeoutPolicy{Timeout: timeout}
+	}
+
+	policy := &RetryPolicy{}
+
+	if val, err := parseAnnotationTimeout(ingress.Annotations, annotationPerTryTimeout); err == nil {
+		policy.PerTryTimeout = val
+		updateRetry = true
+	}
+
+	if retryOn := ingress.Annotations[annotationRetryOn]; retryOn != "" {
+		policy.RetryOn = retryOn
+		updateRetry = true
+	}
+
+	if numRetries := parseAnnotation(ingress.Annotations, annotationNumRetries); numRetries != 0 {
+		policy.NumRetries = numRetries
+		updateRetry = true
+	}
+
+	if updateRetry {
+		r.RetryPolicy = policy
+	}
+
+	return r
 }
 
 // isBlank indicates if a string contains nothing but blank characters.
@@ -713,6 +733,99 @@ func (b *builder) rootAllowed(ir *ingressroutev1.IngressRoute) bool {
 	return false
 }
 
+func (b *builder) processTimeoutPolicy(policy *ingressroutev1.TimeoutPolicy) *TimeoutPolicy {
+	if policy == nil {
+		return nil
+	}
+
+	request, _ := policy.Request.Time()
+	idle, _ := policy.Idle.Time()
+	return &TimeoutPolicy{
+		Timeout:     request,
+		IdleTimeout: idle,
+	}
+}
+
+func (b *builder) statusCodeAppend(src string, statusCode string, codeSet map[string]bool) string {
+	if _, ok := codeSet[statusCode]; ok {
+		return src
+	}
+
+	if src == "" {
+		src = statusCode
+	} else {
+		src = fmt.Sprintf("%s,%s", src, statusCode)
+	}
+	codeSet[statusCode] = true
+
+	return src
+}
+
+func (b *builder) parseRetryOn(specStatusCodes []string) (string, []uint32) {
+	var retryOn string
+	var retryCodes []uint32
+
+	var codeSet = make(map[string]bool)
+
+	if len(specStatusCodes) < 1 {
+		return retryOn, retryCodes
+	}
+
+	for _, statusCode := range specStatusCodes {
+		if expandedStatusCodes, valid := b.validateStatusCode(statusCode); valid {
+			retryOn = b.statusCodeAppend(retryOn, "retriable-status-codes", codeSet)
+			retryCodes = append(retryCodes, expandedStatusCodes...)
+		}
+	}
+
+	return retryOn, retryCodes
+}
+
+func (b *builder) validateStatusCode(statusCode string) ([]uint32, bool) {
+	code, err := b.parseInteger(statusCode)
+	valid := false
+	var expandedStatusCodes []uint32
+	if err != nil {
+		s := strings.Split(strings.ToLower(statusCode), "x")
+		smallest, err1 := b.parseInteger(strings.Join(s, "0"))
+		largest, err2 := b.parseInteger(strings.Join(s, "9"))
+		if err1 == nil && err2 == nil {
+			for code := smallest; code < largest+1; code++ {
+				expandedStatusCodes = append(expandedStatusCodes, uint32(code))
+			}
+			valid = smallest >= 500 && largest <= 509
+		}
+
+	} else {
+		expandedStatusCodes = append(expandedStatusCodes, uint32(code))
+		valid = 509 >= code && code >= 500
+	}
+
+	return expandedStatusCodes, valid
+}
+
+func (b *builder) parseInteger(value string) (int, error) {
+	num, err := strconv.ParseInt(value, 10, 32)
+	return int(num), err
+}
+
+func (b *builder) processRetryPolicy(policy *ingressroutev1.RetryPolicy) *RetryPolicy {
+	if policy == nil {
+		return nil
+	}
+
+	numRetries, _ := b.parseInteger(policy.NumRetries)
+	perTryTimeout, _ := policy.PerTryTimeout.Time()
+	retryOn, retriableStatusCodes := b.parseRetryOn(policy.OnStatusCodes)
+
+	return &RetryPolicy{
+		NumRetries:           numRetries,
+		RetryOn:              retryOn,
+		RetriableStatusCodes: retriableStatusCodes,
+		PerTryTimeout:        perTryTimeout,
+	}
+}
+
 func (b *builder) processRoutes(ir *ingressroutev1.IngressRoute, prefixMatch string, visited []*ingressroutev1.IngressRoute, host string, enforceTLS bool) {
 	visited = append(visited, ir)
 
@@ -751,6 +864,9 @@ func (b *builder) processRoutes(ir *ingressroutev1.IngressRoute, prefixMatch str
 					r.addHTTPService(s)
 				}
 			}
+
+			r.TimeoutPolicy = b.processTimeoutPolicy(route.TimeoutPolicy)
+			r.RetryPolicy = b.processRetryPolicy(route.RetryPolicy)
 
 			b.lookupVirtualHost(host).addRoute(r)
 			b.lookupSecureVirtualHost(host).addRoute(r)

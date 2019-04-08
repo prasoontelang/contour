@@ -26,37 +26,43 @@ import (
 )
 
 func TestParseAnnotationTimeout(t *testing.T) {
+	type TimeoutAnnotation struct {
+		timeout time.Duration
+		err     bool
+	}
+
 	tests := map[string]struct {
 		a    map[string]string
-		want time.Duration
+		want TimeoutAnnotation
 	}{
 		"nada": {
 			a:    nil,
-			want: 0,
+			want: TimeoutAnnotation{0, true},
 		},
 		"empty": {
 			a:    map[string]string{annotationRequestTimeout: ""}, // not even sure this is possible via the API
-			want: 0,
+			want: TimeoutAnnotation{0, true},
 		},
 		"infinity": {
 			a:    map[string]string{annotationRequestTimeout: "infinity"},
-			want: -1,
+			want: TimeoutAnnotation{-1, false},
 		},
 		"10 seconds": {
 			a:    map[string]string{annotationRequestTimeout: "10s"},
-			want: 10 * time.Second,
+			want: TimeoutAnnotation{10 * time.Second, false},
 		},
 		"invalid": {
 			a:    map[string]string{annotationRequestTimeout: "10"}, // 10 what?
-			want: -1,
+			want: TimeoutAnnotation{-1, false},
 		},
 	}
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			got := parseAnnotationTimeout(tc.a, annotationRequestTimeout)
-			if got != tc.want {
-				t.Fatalf("parseAnnotationTimeout(%q): want: %v, got: %v", tc.a, tc.want, got)
+			got, err := parseAnnotationTimeout(tc.a, annotationRequestTimeout)
+			errOccured := (err != nil)
+			if got != tc.want.timeout || errOccured != tc.want.err {
+				t.Fatalf("parseAnnotationTimeout(%q): want: %v, got: {%v, %v} - %+v", tc.a, tc.want, got, errOccured, err)
 			}
 		})
 	}
